@@ -1,0 +1,12 @@
+# Ambiente virtual (cada pessoa cria o seu com: python -m venv venv)
+venv/
+
+# Arquivos temporários do Python
+__pycache__/
+*.py[cod]
+
+# Banco SQLite padrão do Django (não usamos, usamos MySQL)
+db.sqlite3
+
+# Credenciais e configurações locais (nunca subir senhas pro GitHub)
+.env
