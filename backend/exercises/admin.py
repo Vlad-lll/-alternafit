@@ -34,3 +34,18 @@ class ExerciseAdmin(admin.ModelAdmin):
     search_fields = ['name']
     filter_horizontal = ['muscular_groups', 'equipment']
     inlines = [ExerciseAlternativeInline]
+
+
+@admin.register(ExerciseAlternative)
+class ExerciseAlternativeAdmin(admin.ModelAdmin):
+    """Lista de todas as ligações exercício → alternativa, para revisão."""
+
+    list_display = ['exercise', 'alternative', 'order', 'alternative_is_equipment_free']
+    list_filter = ['alternative__is_equipment_free']
+    list_select_related = ['exercise', 'alternative']
+    search_fields = ['exercise__name', 'alternative__name']
+    autocomplete_fields = ['exercise', 'alternative']
+
+    @admin.display(boolean=True, description='sem equipamento')
+    def alternative_is_equipment_free(self, obj):
+        return obj.alternative.is_equipment_free
