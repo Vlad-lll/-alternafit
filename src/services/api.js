@@ -1,35 +1,39 @@
 /**
  * SERVICE LAYER
- * Isola toda a "busca de dados" num só lugar. Hoje ele só repassa
- * para o mock em src/data/exercicios.js. Quando a API do Django
- * estiver pronta, troca-se o corpo destas funções por fetch/axios,
- * sem precisar tocar em nenhum componente que já usa este arquivo.
+ * Isola toda a "busca de dados" num só lugar. As funções consultam a API
+ * do Django (pasta backend/), que devolve os exercícios no mesmo formato
+ * do mock em src/data/exercicios.js, então nenhum componente precisou mudar.
  *
- * Exemplo de como ficará no futuro (comentado):
+ * O endereço da API pode ser trocado pela variável de ambiente VITE_API_URL
+ * (útil quando o backend for publicado na internet).
  *
- * export async function buscarExercicioPorNome(termo) {
- *   const resposta = await fetch(`${BASE_URL}/exercicios/buscar?nome=${termo}`);
- *   if (!resposta.ok) throw new Error("Erro ao buscar exercício");
- *   return resposta.json();
- * }
+ * A versão original deste arquivo (que lia o mock) está guardada na tag
+ * "backup-frontend-vlad" do Git.
  */
 
-import {
-  buscarPorNome,
-  buscarPorGrupoMuscular,
-  GRUPOS_MUSCULARES,
-} from "../data/exercicios";
+const BASE_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000/api";
 
-// const BASE_URL = "http://localhost:8000/api"; // usar quando o Django estiver no ar
+async function buscarJson(caminho) {
+  const resposta = await fetch(`${BASE_URL}${caminho}`);
+  if (!resposta.ok) throw new Error(`Erro ao consultar a API (${resposta.status})`);
+  return resposta.json();
+}
 
+/** Busca um exercício pelo nome, apelido ou parte dele. A API devolve o nome exato primeiro. */
 export async function buscarExercicioPorNome(termo) {
-  return Promise.resolve(buscarPorNome(termo));
+  const chave = termo.trim();
+  if (!chave) return null;
+  const lista = await buscarJson(`/exercicios/?busca=${encodeURIComponent(chave)}`);
+  return lista[0] ?? null;
 }
 
+/** Retorna os exercícios que trabalham o grupo muscular (os de foco principal primeiro). */
 export async function buscarExerciciosPorGrupoMuscular(grupo) {
-  return Promise.resolve(buscarPorGrupoMuscular(grupo));
+  return buscarJson(`/exercicios/?grupo=${encodeURIComponent(grupo)}`);
 }
 
+/** Retorna os nomes dos grupos musculares (para os chips de navegação). */
 export async function obterGruposMusculares() {
-  return Promise.resolve(GRUPOS_MUSCULARES);
+  const grupos = await buscarJson("/grupos-musculares/");
+  return grupos.map((grupo) => grupo.nome);
 }
