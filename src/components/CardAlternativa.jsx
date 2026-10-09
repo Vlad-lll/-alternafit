@@ -71,27 +71,30 @@ export default function CardAlternativa({ exercicio, favoritos, onToggleFavorito
         {dicaTexto}
       </p>
 
-      <button
-        onClick={() => onVerVideo({ nome: exercicio.nome, url: exercicio.videoUrl || null })}
-        style={{
-          marginTop: 4,
-          background: cores.cardFundoAlt,
-          border: `1px solid ${cores.borda}`,
-          borderRadius: 12,
-          padding: "12px 14px",
-          minHeight: 44,
-          color: cores.texto,
-          fontWeight: 700,
-          fontSize: 13,
-          cursor: "pointer",
-          display: "flex",
-          alignItems: "center",
-          justifyContent: "center",
-          gap: 8,
-        }}
-      >
-        ▶ Ver vídeo
-      </button>
+      {/* O botão só aparece quando o exercício tem vídeo cadastrado */}
+      {exercicio.videoUrl && (
+        <button
+          onClick={() => onVerVideo({ nome: exercicio.nome, url: exercicio.videoUrl })}
+          style={{
+            marginTop: 4,
+            background: cores.cardFundoAlt,
+            border: `1px solid ${cores.borda}`,
+            borderRadius: 12,
+            padding: "12px 14px",
+            minHeight: 44,
+            color: cores.texto,
+            fontWeight: 700,
+            fontSize: 13,
+            cursor: "pointer",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            gap: 8,
+          }}
+        >
+          ▶ Ver vídeo
+        </button>
+      )}
     </div>
   );
 }

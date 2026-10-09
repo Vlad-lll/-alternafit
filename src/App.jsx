@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import Header from "./components/Header";
 import SearchBar from "./components/SearchBar";
 import FiltroChips from "./components/FiltroChips";
@@ -13,10 +13,28 @@ import {
   obterGruposMusculares,
 } from "./services/api";
 
+const MENSAGEM_ERRO =
+  "Não foi possível falar com o servidor. Confira sua conexão e tente de novo.";
+
+// Os favoritos ficam salvos no próprio navegador (localStorage), sem precisar de login.
+const CHAVE_FAVORITOS = "alternafit:favoritos";
+
+function lerFavoritosSalvos() {
+  try {
+    const salvos = JSON.parse(localStorage.getItem(CHAVE_FAVORITOS));
+    if (!Array.isArray(salvos)) return [];
+    // Mantém só códigos de exercício válidos (números inteiros), sem repetição
+    return [...new Set(salvos.filter((id) => Number.isInteger(id) && id > 0))];
+  } catch {
+    return [];
+  }
+}
+
 export default function App() {
   const [termoBusca, setTermoBusca] = useState("Supino Reto com Barra");
   const [exercicioAtivo, setExercicioAtivo] = useState(null);
-  const [naoEncontrado, setNaoEncontrado] = useState(false);
+  // Mensagem mostrada quando a busca não encontra nada (ou quando a busca está vazia)
+  const [aviso, setAviso] = useState(null);
 
   const [grupos, setGrupos] = useState([]);
   const [grupoSelecionado, setGrupoSelecionado] = useState("Todos");
@@ -24,39 +42,104 @@ export default function App() {
 
   const [filtroEquipamento, setFiltroEquipamento] = useState("Todos");
 
-  const [favoritos, setFavoritos] = useState([]);
+  const [favoritos, setFavoritos] = useState(lerFavoritosSalvos);
   const [videoAberto, setVideoAberto] = useState(null);
 
-  // Carrega o exercício inicial e a lista de grupos musculares (para os chips)
-  useEffect(() => {
-    buscarExercicioPorNome("Supino Reto com Barra").then(setExercicioAtivo);
-    obterGruposMusculares().then(setGrupos);
-  }, []);
+  const [carregando, setCarregando] = useState(true);
+  const [erro, setErro] = useState(null);
+  // Guarda a última consulta feita, para o botão "Tentar de novo" repetir exatamente ela
+  const ultimaConsulta = useRef(null);
+  // Número da consulta mais recente. Com internet lenta, uma resposta antiga pode chegar
+  // depois de uma nova; esse número permite ignorar respostas que já ficaram velhas.
+  const idConsulta = useRef(0);
 
-  async function buscar(e) {
-    e.preventDefault();
-    const resultado = await buscarExercicioPorNome(termoBusca);
-    if (resultado) {
-      setExercicioAtivo(resultado);
-      setNaoEncontrado(false);
-      setGrupoSelecionado("Todos");
-      setFiltroEquipamento("Todos");
-    } else {
-      setNaoEncontrado(true);
+  /**
+   * Roda uma consulta à API mostrando "Carregando..." e, se falhar, a mensagem de erro.
+   * A consulta recebe a função aindaAtual(), que diz se ela ainda é a mais recente.
+   */
+  async function comCarregamento(consulta) {
+    const id = ++idConsulta.current;
+    const aindaAtual = () => id === idConsulta.current;
+    ultimaConsulta.current = consulta;
+    setCarregando(true);
+    setErro(null);
+    try {
+      await consulta(aindaAtual);
+    } catch {
+      if (aindaAtual()) setErro(MENSAGEM_ERRO);
+    } finally {
+      if (aindaAtual()) setCarregando(false);
     }
   }
 
-  async function selecionarGrupo(grupo) {
-    setGrupoSelecionado(grupo);
+  // Carrega o exercício inicial e a lista de grupos musculares (para os chips)
+  function carregarInicio() {
+    comCarregamento(async (aindaAtual) => {
+      const [exercicio, listaGrupos] = await Promise.all([
+        buscarExercicioPorNome("Supino Reto com Barra"),
+        obterGruposMusculares(),
+      ]);
+      setGrupos(listaGrupos);
+      if (aindaAtual()) setExercicioAtivo(exercicio);
+    });
+  }
+
+  useEffect(carregarInicio, []);
+
+  // Salva os favoritos no navegador sempre que a lista muda
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHAVE_FAVORITOS, JSON.stringify(favoritos));
+    } catch {
+      // Navegador sem armazenamento (ex.: modo privado): os favoritos valem só nesta visita.
+    }
+  }, [favoritos]);
+
+  function buscar(e) {
+    e.preventDefault();
+    const termo = termoBusca.trim();
+    if (!termo) {
+      setAviso("Digite o nome de um exercício para buscar.");
+      return;
+    }
+    comCarregamento(async (aindaAtual) => {
+      const resultado = await buscarExercicioPorNome(termo);
+      if (!aindaAtual()) return;
+      if (resultado) {
+        setExercicioAtivo(resultado);
+        setAviso(null);
+        setGrupoSelecionado("Todos");
+        setFiltroEquipamento("Todos");
+      } else {
+        setAviso(
+          `Nenhum exercício encontrado para "${termo}". Tente outro nome ou navegue por grupo muscular acima.`
+        );
+      }
+    });
+  }
+
+  function selecionarGrupo(grupo) {
+    setAviso(null);
     if (grupo === "Todos") {
+      // Saindo de um grupo: descarta a resposta do grupo que ainda estava chegando
+      if (grupoSelecionado !== "Todos") {
+        idConsulta.current += 1;
+        setCarregando(false);
+      }
+      setGrupoSelecionado(grupo);
       setExerciciosDoGrupo([]);
       return;
     }
-    const lista = await buscarExerciciosPorGrupoMuscular(grupo);
-    setExerciciosDoGrupo(lista);
+    setGrupoSelecionado(grupo);
+    comCarregamento(async (aindaAtual) => {
+      setExerciciosDoGrupo([]);
+      const lista = await buscarExerciciosPorGrupoMuscular(grupo);
+      if (aindaAtual()) setExerciciosDoGrupo(lista);
+    });
   }
 
   function escolherExercicioDoGrupo(exercicio) {
+    setAviso(null);
     setExercicioAtivo(exercicio);
     setTermoBusca(exercicio.nome);
     setGrupoSelecionado("Todos");
@@ -121,7 +204,45 @@ export default function App() {
           </div>
         </section>
 
-        {naoEncontrado && !navegandoPorGrupo && (
+        {erro && (
+          <div
+            style={{
+              background: cores.cardFundo,
+              border: `1px solid ${cores.perigo}`,
+              borderRadius: 16,
+              padding: 24,
+              textAlign: "center",
+              color: cores.texto,
+              marginBottom: 30,
+            }}
+          >
+            <p style={{ margin: "0 0 14px" }}>{erro}</p>
+            <button
+              onClick={() => comCarregamento(ultimaConsulta.current)}
+              style={{
+                background: cores.navy,
+                color: cores.navyTexto,
+                border: "none",
+                borderRadius: 12,
+                padding: "10px 22px",
+                minHeight: 44,
+                fontWeight: 800,
+                fontSize: 14,
+                cursor: "pointer",
+              }}
+            >
+              Tentar de novo
+            </button>
+          </div>
+        )}
+
+        {carregando && (
+          <div style={{ textAlign: "center", color: cores.textoSecundario, fontSize: 14, marginBottom: 24 }}>
+            Carregando...
+          </div>
+        )}
+
+        {aviso && !erro && (
           <div
             style={{
               background: cores.cardFundo,
@@ -131,10 +252,11 @@ export default function App() {
               textAlign: "center",
               color: cores.textoSecundario,
               marginBottom: 30,
+              // Quebra palavras enormes (ex.: alguém colou um texto gigante) para não estourar a tela
+              overflowWrap: "anywhere",
             }}
           >
-            Nenhum exercício encontrado para "{termoBusca}". Tente outro nome
-            ou navegue por grupo muscular acima.
+            {aviso}
           </div>
         )}
 
@@ -144,7 +266,7 @@ export default function App() {
               EXERCÍCIOS DE {grupoSelecionado.toUpperCase()}
             </div>
 
-            {exerciciosDoGrupo.length === 0 ? (
+            {carregando || erro ? null : exerciciosDoGrupo.length === 0 ? (
               <div style={{ color: cores.textoSecundario, fontSize: 14 }}>
                 Nenhum exercício cadastrado nesse grupo ainda.
               </div>

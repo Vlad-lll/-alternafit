@@ -1,7 +1,17 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { cores } from "../styles/theme";
 
 export default function ModalVideo({ video, onClose }) {
+  // Fecha a janela com a tecla Esc, como as pessoas esperam de uma janela desse tipo
+  useEffect(() => {
+    if (!video) return undefined;
+    function fecharComEsc(e) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("keydown", fecharComEsc);
+    return () => document.removeEventListener("keydown", fecharComEsc);
+  }, [video, onClose]);
+
   if (!video) return null;
   const { nome, url } = video;
 

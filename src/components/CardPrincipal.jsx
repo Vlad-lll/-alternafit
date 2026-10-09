@@ -60,23 +60,26 @@ export default function CardPrincipal({ exercicio, totalAlternativasVisiveis, on
         </p>
       )}
 
-      <button
-        onClick={() => onVerVideo({ nome: exercicio.nome, url: exercicio.videoUrl || null })}
-        style={{
-          alignSelf: "flex-start",
-          background: cores.cardFundoAlt,
-          border: `1px solid ${cores.borda}`,
-          borderRadius: 12,
-          padding: "10px 16px",
-          minHeight: 44,
-          color: cores.texto,
-          fontWeight: 700,
-          fontSize: 13,
-          cursor: "pointer",
-        }}
-      >
-        ▶ Ver vídeo
-      </button>
+      {/* O botão só aparece quando o exercício tem vídeo cadastrado */}
+      {exercicio.videoUrl && (
+        <button
+          onClick={() => onVerVideo({ nome: exercicio.nome, url: exercicio.videoUrl })}
+          style={{
+            alignSelf: "flex-start",
+            background: cores.cardFundoAlt,
+            border: `1px solid ${cores.borda}`,
+            borderRadius: 12,
+            padding: "10px 16px",
+            minHeight: 44,
+            color: cores.texto,
+            fontWeight: 700,
+            fontSize: 13,
+            cursor: "pointer",
+          }}
+        >
+          ▶ Ver vídeo
+        </button>
+      )}
     </div>
   );
 }
