@@ -1,19 +1,25 @@
 """
-Importa a planilha de exercícios do time de Educação Física para o banco.
+Importa a planilha do banco de exercícios (formato "modelo de banco de dados",
+versão 2.2 em diante: uma aba por tabela, com IDs fixos) e SUBSTITUI todo o
+catálogo de exercícios do banco pelo conteúdo da planilha.
 
 Uso (dentro da pasta backend/):
     venv\\Scripts\\python.exe manage.py importar_planilha "..\\data\\arquivo.xlsx" --dry-run
     venv\\Scripts\\python.exe manage.py importar_planilha "..\\data\\arquivo.xlsx"
 
-- Pode ser rodado várias vezes: os registros são encontrados pelo nome e
-  atualizados, sem duplicar.
 - --dry-run simula tudo e mostra o relatório, mas não grava nada.
-- Tudo acontece dentro de uma transação: se der erro no meio, o banco
-  volta exatamente como estava.
+- Antes de gravar, a planilha inteira é conferida (IDs, referências entre
+  abas, duplicatas). Se houver qualquer erro, nada é gravado.
+- Tudo acontece dentro de uma transação: se der erro no meio, o banco volta
+  exatamente como estava.
+- Os IDs da planilha viram os IDs do banco, então o "codigo" de cada
+  exercício na API continua o mesmo entre uma importação e outra.
+- Usuários e logins do Admin não são afetados.
 """
 
 import re
 import unicodedata
+from collections import Counter, defaultdict
 from pathlib import Path
 
 from django.core.exceptions import ValidationError
@@ -22,72 +28,82 @@ from django.core.validators import URLValidator
 from django.db import transaction
 from openpyxl import load_workbook
 
-from exercises.models import Difficulty, Equipment, Exercise, ExerciseAlternative, MuscularGroup
+from exercises.models import (
+    Difficulty,
+    Equipment,
+    Exercise,
+    ExerciseAlias,
+    ExerciseAlternative,
+    ExerciseMuscularGroup,
+    ExerciseStep,
+    MovementPattern,
+    MuscularGroup,
+    Source,
+)
 
-BODYWEIGHT_EQUIPMENT = 'Nenhum (peso do corpo)'
+# Colunas obrigatórias de cada aba. Colunas extras (como _aux_ e _calc_) são ignoradas.
+SHEETS = {
+    'nivel_dificuldade': ['id', 'nome', 'descricao'],
+    'grupo_muscular': ['id', 'codigo', 'nome', 'regiao', 'descricao'],
+    'equipamento': ['id', 'nome', 'categoria', 'descricao'],
+    'padrao_movimento': ['id', 'codigo', 'nome'],
+    'fonte': ['id', 'autor_organizacao', 'titulo', 'url', 'tipo'],
+    'exercicio': [
+        'id', 'nome', 'nome_en', 'descricao', 'nivel_id', 'padrao_movimento_id',
+        'dica_execucao', 'video_url', 'status_dados', 'observacao',
+    ],
+    'exercicio_grupo_muscular': ['exercicio_id', 'grupo_muscular_id', 'papel'],
+    'exercicio_equipamento': ['exercicio_id', 'equipamento_id'],
+    'exercicio_alternativo': ['exercicio_id', 'alternativo_id', 'ordem', 'observacao'],
+    'exercicio_passo': ['exercicio_id', 'ordem', 'descricao', 'dica_extra'],
+    'exercicio_apelido': ['exercicio_id', 'apelido'],
+    'exercicio_fonte': ['exercicio_id', 'fonte_id'],
+}
 
-# Trecho que o cabeçalho de cada coluna precisa conter (em minúsculas e sem
-# acentos). Serve para detectar colunas trocadas de lugar na planilha.
-EXPECTED_HEADERS = {
-    'Dificuldades': ['nivel', 'nome', 'descricao'],
-    'Grupos Musculares': ['nome', 'descricao'],
-    'Equipamentos': ['nome', 'descricao'],
-    'Exercícios': [
-        'codigo', 'nome', 'descricao', 'nivel', 'grupo',
-        'precisa de equipamento', 'equipamento', 'dica', 'video',
-    ],
-    'Alternativas': [
-        'exercicio original', 'codigo', 'exercicio alternativo', 'codigo',
-        'ordem', 'sem equipamento',
-    ],
+ROLE_VALUES = {
+    'primario': ExerciseMuscularGroup.Role.PRIMARY,
+    'principal': ExerciseMuscularGroup.Role.PRIMARY,
+    'secundario': ExerciseMuscularGroup.Role.SECONDARY,
+    'auxiliar': ExerciseMuscularGroup.Role.SECONDARY,
 }
 
 
-def clean_name(value):
-    """Texto da célula numa linha só, sem espaços sobrando."""
-    if value is None:
-        return ''
-    return re.sub(r'\s+', ' ', str(value)).strip()
-
-
-def clean_long_text(value):
-    """Texto longo (descrição, dica): mantém quebras de linha, tira espaços das pontas."""
+def text(value):
     if value is None:
         return ''
     return str(value).strip()
 
 
 def fold(value):
-    """Minúsculas e sem acentos, para comparar textos ("Não " vira "nao")."""
-    normalized = unicodedata.normalize('NFKD', clean_name(value).lower())
-    return ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    """Minúsculas, sem acentos e sem espaços repetidos, para comparar textos."""
+    normalized = unicodedata.normalize('NFKD', text(value).lower())
+    normalized = ''.join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r'\s+', ' ', normalized)
 
 
-def parse_yes_no(value):
-    answer = fold(value)
-    if answer in ('sim', 's'):
-        return True
-    if answer in ('nao', 'n'):
-        return False
-    return None
-
-
-def parse_int(value):
-    text = clean_name(value).replace(',', '.')
+def to_int(value):
     try:
-        number = float(text)
+        number = float(text(value).replace(',', '.'))
     except ValueError:
         return None
     return int(number) if number.is_integer() else None
 
 
-def split_names(value):
-    """"Peitoral, Tríceps" -> ["Peitoral", "Tríceps"]"""
-    return [name for name in (clean_name(part) for part in clean_name(value).split(',')) if name]
+def choice_lookup(choices):
+    """Permite achar o valor de um TextChoices pelo texto que aparece na planilha (o rótulo)."""
+    return {fold(label): value for value, label in choices}
+
+
+def is_valid_url(url):
+    try:
+        URLValidator()(url)
+    except ValidationError:
+        return False
+    return True
 
 
 class Command(BaseCommand):
-    help = 'Importa a planilha de exercícios do time de Educação Física para o banco de dados.'
+    help = 'Substitui o catálogo de exercícios do banco pelo conteúdo da planilha (formato v2.2 em diante).'
 
     def add_arguments(self, parser):
         parser.add_argument('arquivo', help='Caminho do arquivo .xlsx')
@@ -96,265 +112,350 @@ class Command(BaseCommand):
             action='store_true',
             help='Simula a importação e mostra o relatório, sem gravar nada no banco.',
         )
+        parser.add_argument(
+            '--detalhes',
+            action='store_true',
+            help='Lista também as trocas "fracas" (alternativa sem o mesmo grupo principal nem o mesmo padrão).',
+        )
 
     def handle(self, *args, **options):
         path = Path(options['arquivo'])
         if not path.exists():
             raise CommandError(f'Arquivo não encontrado: {path}')
 
-        self.stats = {}
+        self.errors = []
         self.warnings = []
-        self.rule_problems = []
+        tables = self.read_workbook(path)
+        self.validate(tables)
+        if self.errors:
+            self.stdout.write(self.style.ERROR(f'\nA planilha tem {len(self.errors)} erro(s). Nada foi gravado:'))
+            for error in self.errors:
+                self.stdout.write(self.style.ERROR(f'  - {error}'))
+            raise CommandError('Corrija a planilha e rode de novo.')
 
-        workbook = load_workbook(path, data_only=True, read_only=True)
-        try:
-            with transaction.atomic():
-                self.import_difficulties(self.rows(workbook, 'Dificuldades'))
-                self.import_simple_table(MuscularGroup, 'Grupos Musculares', self.rows(workbook, 'Grupos Musculares'))
-                self.import_simple_table(Equipment, 'Equipamentos', self.rows(workbook, 'Equipamentos'))
-                sheet_exercises = self.import_exercises(self.rows(workbook, 'Exercícios'))
-                self.import_alternatives(self.rows(workbook, 'Alternativas'))
-                self.check_rules(sheet_exercises)
-                incomplete = self.find_incomplete_exercises()
-                if options['dry_run']:
-                    transaction.set_rollback(True)
-            ignored_steps = 'Passos de Execução' in workbook.sheetnames
-        finally:
-            workbook.close()
+        with transaction.atomic():
+            removed = self.clear_catalog()
+            created = self.write(tables)
+            if options['dry_run']:
+                transaction.set_rollback(True)
 
-        self.print_report(options['dry_run'], incomplete, ignored_steps)
+        self.print_report(options, removed, created, self.check_rules(tables))
 
     # ------------------------------------------------------------------ leitura
 
-    def rows(self, workbook, sheet_name):
-        """Confere o cabeçalho da aba e devolve (número da linha, valores) de cada linha de dados."""
-        if sheet_name not in workbook.sheetnames:
-            raise CommandError(f'A planilha não tem a aba "{sheet_name}".')
+    def read_workbook(self, path):
+        workbook = load_workbook(path, data_only=True, read_only=True)
+        try:
+            tables = {}
+            for sheet_name, required in SHEETS.items():
+                if sheet_name not in workbook.sheetnames:
+                    raise CommandError(f'A planilha não tem a aba "{sheet_name}". Ela está no formato v2.2 ou mais novo?')
+                rows = workbook[sheet_name].iter_rows(values_only=True)
+                header = [text(cell) for cell in next(rows, ())]
+                missing = [column for column in required if column not in header]
+                if missing:
+                    raise CommandError(f'Aba "{sheet_name}": faltam as colunas {missing}.')
+                records = []
+                for number, values in enumerate(rows, start=2):
+                    record = {column: values[header.index(column)] if header.index(column) < len(values) else None
+                              for column in required}
+                    if all(text(value) == '' for value in record.values()):
+                        continue
+                    record['_linha'] = number
+                    records.append(record)
+                tables[sheet_name] = records
+            return tables
+        finally:
+            workbook.close()
 
-        expected = EXPECTED_HEADERS[sheet_name]
-        rows = workbook[sheet_name].iter_rows(values_only=True)
-        header = list(next(rows, ()))
-        for index, part in enumerate(expected):
-            found = header[index] if index < len(header) else None
-            if part not in fold(found):
-                raise CommandError(
-                    f'Aba "{sheet_name}", coluna {index + 1}: esperava um cabeçalho contendo '
-                    f'"{part}", mas encontrou "{clean_name(found)}". As colunas mudaram de lugar?'
-                )
+    # --------------------------------------------------------------- conferência
 
-        result = []
-        for number, values in enumerate(rows, start=2):
-            values = list(values) + [None] * len(expected)
-            result.append((number, values[:len(expected)]))
-        return result
+    def error(self, sheet, record, message):
+        self.errors.append(f'{sheet}, linha {record["_linha"]}: {message}')
 
-    # --------------------------------------------------------------- importação
+    def validate(self, tables):
+        ids = {}
+        for sheet in ['nivel_dificuldade', 'grupo_muscular', 'equipamento', 'padrao_movimento', 'fonte', 'exercicio']:
+            seen = set()
+            for record in tables[sheet]:
+                record['id'] = to_int(record['id'])
+                if record['id'] is None or record['id'] < 1:
+                    self.error(sheet, record, 'id vazio ou inválido.')
+                elif record['id'] in seen:
+                    self.error(sheet, record, f'id {record["id"]} repetido.')
+                seen.add(record['id'])
+            ids[sheet] = seen
 
-    def import_difficulties(self, rows):
-        for number, (level_cell, name_cell, description_cell) in rows:
-            name = clean_name(name_cell)
-            level = parse_int(level_cell)
-            if not name and level is None:
-                continue
-            if not name or level not in (1, 2, 3):
-                self.warn(f'Dificuldades, linha {number}: precisa de nível (1 a 3) e nome. Linha ignorada.')
-                continue
-            _, created = Difficulty.objects.update_or_create(
-                level=level,
-                defaults={'name': name, 'description': clean_long_text(description_cell)},
+        for record in tables['nivel_dificuldade']:
+            if record['id'] not in (1, 2, 3):
+                self.error('nivel_dificuldade', record, 'o id do nível precisa ser 1, 2 ou 3.')
+
+        self.check_unique_text(tables, 'grupo_muscular', 'nome')
+        self.check_unique_text(tables, 'equipamento', 'nome')
+        self.check_unique_text(tables, 'padrao_movimento', 'codigo')
+        self.check_unique_text(tables, 'padrao_movimento', 'nome')
+        self.check_unique_text(tables, 'exercicio', 'nome')
+        self.check_unique_text(tables, 'exercicio_apelido', 'apelido')
+
+        for record in tables['fonte']:
+            if not text(record['titulo']) or not text(record['autor_organizacao']):
+                self.error('fonte', record, 'autor e título são obrigatórios.')
+            if not is_valid_url(text(record['url'])):
+                self.error('fonte', record, f'URL inválida: "{text(record["url"])}".')
+
+        for record in tables['exercicio']:
+            for column, sheet in [('nivel_id', 'nivel_dificuldade'), ('padrao_movimento_id', 'padrao_movimento')]:
+                if text(record[column]):
+                    record[column] = to_int(record[column])
+                    if record[column] not in ids[sheet]:
+                        self.error('exercicio', record, f'{column} {record[column]} não existe na aba {sheet}.')
+                else:
+                    record[column] = None
+            video = text(record['video_url'])
+            if video and not is_valid_url(video):
+                self.warnings.append(f'exercicio, linha {record["_linha"]}: link de vídeo inválido. Ignorado.')
+                record['video_url'] = ''
+
+        links = [
+            ('exercicio_grupo_muscular', [('exercicio_id', 'exercicio'), ('grupo_muscular_id', 'grupo_muscular')]),
+            ('exercicio_equipamento', [('exercicio_id', 'exercicio'), ('equipamento_id', 'equipamento')]),
+            ('exercicio_alternativo', [('exercicio_id', 'exercicio'), ('alternativo_id', 'exercicio')]),
+            ('exercicio_fonte', [('exercicio_id', 'exercicio'), ('fonte_id', 'fonte')]),
+            ('exercicio_passo', [('exercicio_id', 'exercicio')]),
+            ('exercicio_apelido', [('exercicio_id', 'exercicio')]),
+        ]
+        for sheet, references in links:
+            for record in tables[sheet]:
+                for column, target in references:
+                    record[column] = to_int(record[column])
+                    if record[column] not in ids[target]:
+                        self.error(sheet, record, f'{column} {record[column]} não existe na aba {target}.')
+
+        self.check_unique_pair(tables, 'exercicio_grupo_muscular', 'exercicio_id', 'grupo_muscular_id')
+        self.check_unique_pair(tables, 'exercicio_equipamento', 'exercicio_id', 'equipamento_id')
+        self.check_unique_pair(tables, 'exercicio_alternativo', 'exercicio_id', 'alternativo_id')
+        self.check_unique_pair(tables, 'exercicio_fonte', 'exercicio_id', 'fonte_id')
+        self.check_unique_pair(tables, 'exercicio_passo', 'exercicio_id', 'ordem')
+
+        for record in tables['exercicio_grupo_muscular']:
+            role = ROLE_VALUES.get(fold(record['papel']))
+            if role is None:
+                self.error('exercicio_grupo_muscular', record, f'papel "{text(record["papel"])}" inválido (use PRIMARIO ou SECUNDARIO).')
+            record['papel'] = role
+
+        for sheet in ['exercicio_alternativo', 'exercicio_passo']:
+            for record in tables[sheet]:
+                record['ordem'] = to_int(record['ordem'])
+                if record['ordem'] is None or record['ordem'] < 1:
+                    self.error(sheet, record, 'ordem vazia ou inválida.')
+
+        for record in tables['exercicio_alternativo']:
+            if record['exercicio_id'] == record['alternativo_id']:
+                self.error('exercicio_alternativo', record, 'um exercício não pode ser alternativa de si mesmo.')
+
+        exercise_names = {fold(r['nome']): r['id'] for r in tables['exercicio']}
+        for record in tables['exercicio_apelido']:
+            owner = exercise_names.get(fold(record['apelido']))
+            if owner is not None and owner != record['exercicio_id']:
+                self.error('exercicio_apelido', record, f'o apelido "{text(record["apelido"])}" é o nome de outro exercício.')
+        for record in tables['exercicio_passo']:
+            if not text(record['descricao']):
+                self.error('exercicio_passo', record, 'descrição do passo vazia.')
+
+    def check_unique_text(self, tables, sheet, column):
+        seen = {}
+        for record in tables[sheet]:
+            key = fold(record[column])
+            if not key:
+                self.error(sheet, record, f'{column} vazio.')
+            elif key in seen:
+                self.error(sheet, record, f'{column} "{text(record[column])}" repetido (já aparece na linha {seen[key]}).')
+            else:
+                seen[key] = record['_linha']
+
+    def check_unique_pair(self, tables, sheet, first, second):
+        seen = {}
+        for record in tables[sheet]:
+            key = (record[first], to_int(record[second]))
+            if key in seen:
+                self.error(sheet, record, f'combinação repetida (já aparece na linha {seen[key]}).')
+            seen[key] = record['_linha']
+
+    # ------------------------------------------------------------------ gravação
+
+    def clear_catalog(self):
+        """Apaga o catálogo atual (na ordem certa, por causa das referências). Usuários não são afetados."""
+        removed = {'Exercícios': Exercise.objects.count()}
+        for model in [
+            ExerciseAlternative, ExerciseStep, ExerciseAlias, ExerciseMuscularGroup, Exercise,
+            Source, MovementPattern, Equipment, MuscularGroup, Difficulty,
+        ]:
+            model.objects.all().delete()
+        return removed
+
+    def write(self, tables):
+        regions = choice_lookup(MuscularGroup.Region.choices)
+        categories = choice_lookup(Equipment.Category.choices)
+        statuses = choice_lookup(Exercise.DataStatus.choices)
+
+        Difficulty.objects.bulk_create(
+            Difficulty(id=r['id'], level=r['id'], name=text(r['nome']), description=text(r['descricao']))
+            for r in tables['nivel_dificuldade']
+        )
+        groups = []
+        for r in tables['grupo_muscular']:
+            region = regions.get(fold(r['regiao']), '')
+            if text(r['regiao']) and not region:
+                self.warnings.append(f'grupo_muscular, linha {r["_linha"]}: região "{text(r["regiao"])}" desconhecida. Deixada em branco.')
+            groups.append(MuscularGroup(
+                id=r['id'], code=text(r['codigo']), name=text(r['nome']), region=region, description=text(r['descricao']),
+            ))
+        MuscularGroup.objects.bulk_create(groups)
+        equipment = []
+        for r in tables['equipamento']:
+            category = categories.get(fold(r['categoria']), '')
+            if text(r['categoria']) and not category:
+                self.warnings.append(f'equipamento, linha {r["_linha"]}: categoria "{text(r["categoria"])}" desconhecida. Deixada em branco.')
+            equipment.append(Equipment(id=r['id'], name=text(r['nome']), category=category, description=text(r['descricao'])))
+        Equipment.objects.bulk_create(equipment)
+        MovementPattern.objects.bulk_create(
+            MovementPattern(id=r['id'], code=text(r['codigo']), name=text(r['nome'])) for r in tables['padrao_movimento']
+        )
+        Source.objects.bulk_create(
+            Source(
+                id=r['id'], author=text(r['autor_organizacao']), title=text(r['titulo']),
+                url=text(r['url']), source_type=text(r['tipo']),
             )
-            self.count('Dificuldades', created)
+            for r in tables['fonte']
+        )
 
-    def import_simple_table(self, model, label, rows):
-        for _number, (name_cell, description_cell) in rows:
-            name = clean_name(name_cell)
-            if not name:
-                continue
-            _, created = model.objects.update_or_create(
-                name=name,
-                defaults={'description': clean_long_text(description_cell)},
-            )
-            self.count(label, created)
-
-    def import_exercises(self, rows):
         exercises = []
-        seen_names = set()
-        for number, values in rows:
-            (_code, name_cell, description_cell, level_cell, groups_cell,
-             needs_equipment_cell, equipment_cell, tip_cell, video_cell) = values
-            name = clean_name(name_cell)
-            if not name:
-                continue
-            where = f'Exercícios, linha {number} ({name})'
+        for r in tables['exercicio']:
+            status = statuses.get(fold(r['status_dados']), '')
+            if text(r['status_dados']) and not status:
+                self.warnings.append(f'exercicio, linha {r["_linha"]}: status "{text(r["status_dados"])}" desconhecido. Deixado em branco.')
+            exercises.append(Exercise(
+                id=r['id'], name=text(r['nome']), name_en=text(r['nome_en']), description=text(r['descricao']),
+                tip=text(r['dica_execucao']), video_url=text(r['video_url']), difficulty_id=r['nivel_id'],
+                movement_pattern_id=r['padrao_movimento_id'], data_status=status, notes=text(r['observacao']),
+            ))
+        Exercise.objects.bulk_create(exercises)
 
-            if fold(name) in seen_names:
-                self.warn(f'{where}: nome repetido na planilha. Esta linha sobrescreve a anterior.')
-            seen_names.add(fold(name))
-
-            difficulty = None
-            if clean_name(level_cell):
-                level = parse_int(level_cell)
-                difficulty = Difficulty.objects.filter(level=level).first() if level else None
-                if difficulty is None:
-                    self.warn(f'{where}: nível "{clean_name(level_cell)}" não existe na aba Dificuldades.')
-
-            needs_equipment = parse_yes_no(needs_equipment_cell)
-            if needs_equipment is None:
-                self.warn(f'{where}: "Precisa de equipamento?" vazio ou diferente de Sim/Não. Considerado "Sim".')
-                needs_equipment = True
-
-            video_url = clean_name(video_cell)
-            if video_url:
-                try:
-                    URLValidator()(video_url)
-                except ValidationError:
-                    self.warn(f'{where}: link do vídeo inválido ("{video_url}"). Ignorado.')
-                    video_url = ''
-
-            exercise, created = Exercise.objects.update_or_create(
-                name=name,
-                defaults={
-                    'description': clean_long_text(description_cell),
-                    'tip': clean_long_text(tip_cell),
-                    'video_url': video_url,
-                    'difficulty': difficulty,
-                    'is_equipment_free': not needs_equipment,
-                },
+        ExerciseMuscularGroup.objects.bulk_create(
+            ExerciseMuscularGroup(exercise_id=r['exercicio_id'], muscular_group_id=r['grupo_muscular_id'], role=r['papel'])
+            for r in tables['exercicio_grupo_muscular']
+        )
+        Exercise.equipment.through.objects.bulk_create(
+            Exercise.equipment.through(exercise_id=r['exercicio_id'], equipment_id=r['equipamento_id'])
+            for r in tables['exercicio_equipamento']
+        )
+        Exercise.sources.through.objects.bulk_create(
+            Exercise.sources.through(exercise_id=r['exercicio_id'], source_id=r['fonte_id'])
+            for r in tables['exercicio_fonte']
+        )
+        ExerciseAlternative.objects.bulk_create(
+            ExerciseAlternative(
+                exercise_id=r['exercicio_id'], alternative_id=r['alternativo_id'],
+                order=r['ordem'], note=text(r['observacao']),
             )
-            self.count('Exercícios', created)
-
-            exercise.muscular_groups.set(
-                self.get_or_create_many(MuscularGroup, 'Grupos Musculares', split_names(groups_cell), where)
+            for r in tables['exercicio_alternativo']
+        )
+        ExerciseStep.objects.bulk_create(
+            ExerciseStep(
+                exercise_id=r['exercicio_id'], order=r['ordem'],
+                description=text(r['descricao']), extra_tip=text(r['dica_extra']),
             )
-            equipment = self.get_or_create_many(Equipment, 'Equipamentos', split_names(equipment_cell), where)
-            exercise.equipment.set(equipment)
+            for r in tables['exercicio_passo']
+        )
+        ExerciseAlias.objects.bulk_create(
+            ExerciseAlias(exercise_id=r['exercicio_id'], alias=text(r['apelido'])) for r in tables['exercicio_apelido']
+        )
 
-            real_equipment = [e.name for e in equipment if fold(e.name) != fold(BODYWEIGHT_EQUIPMENT)]
-            if exercise.is_equipment_free and real_equipment:
-                self.warn(
-                    f'{where}: marcado como "não precisa de equipamento", mas lista '
-                    f'equipamentos: {", ".join(real_equipment)}.'
-                )
+        return {
+            'Dificuldades': Difficulty.objects.count(),
+            'Grupos musculares': MuscularGroup.objects.count(),
+            'Equipamentos': Equipment.objects.count(),
+            'Padrões de movimento': MovementPattern.objects.count(),
+            'Fontes': Source.objects.count(),
+            'Exercícios': Exercise.objects.count(),
+            'Ligações exercício-grupo': ExerciseMuscularGroup.objects.count(),
+            'Alternativas': ExerciseAlternative.objects.count(),
+            'Passos de execução': ExerciseStep.objects.count(),
+            'Apelidos': ExerciseAlias.objects.count(),
+        }
 
-            exercises.append(exercise)
-        return exercises
+    # ------------------------------------------------------------- regras do app
 
-    def import_alternatives(self, rows):
-        for number, values in rows:
-            original_cell, _code, alternative_cell, _alternative_code, order_cell, equipment_free_cell = values
-            original_name = clean_name(original_cell)
-            alternative_name = clean_name(alternative_cell)
-            # Linhas vazias e os textos de instrução no fim da aba só têm a coluna A.
-            if not (alternative_name or clean_name(order_cell) or clean_name(equipment_free_cell)):
-                continue
-            where = f'Alternativas, linha {number}'
-            if not original_name or not alternative_name:
-                self.warn(f'{where}: falta o exercício original ou o alternativo. Linha ignorada.')
-                continue
-            if fold(original_name) == fold(alternative_name):
-                self.warn(f'{where}: "{original_name}" não pode ser alternativa de si mesmo. Linha ignorada.')
-                continue
+    def check_rules(self, tables):
+        names = {r['id']: text(r['nome']) for r in tables['exercicio']}
+        pattern = {r['id']: r['padrao_movimento_id'] for r in tables['exercicio']}
+        with_equipment = {r['exercicio_id'] for r in tables['exercicio_equipamento']}
+        primary = defaultdict(set)
+        for r in tables['exercicio_grupo_muscular']:
+            if r['papel'] == ExerciseMuscularGroup.Role.PRIMARY:
+                primary[r['exercicio_id']].add(r['grupo_muscular_id'])
+        alternatives = defaultdict(list)
+        for r in tables['exercicio_alternativo']:
+            alternatives[r['exercicio_id']].append(r['alternativo_id'])
 
-            equipment_free = parse_yes_no(equipment_free_cell)
-            original = self.find_or_create_incomplete(original_name, None, where)
-            alternative = self.find_or_create_incomplete(alternative_name, equipment_free, where)
+        problems, weak = [], []
+        for exercise_id, name in names.items():
+            options = alternatives[exercise_id]
+            if not 2 <= len(options) <= 4:
+                problems.append(f'"{name}" tem {len(options)} alternativa(s); a regra é de 2 a 4.')
+            if options and all(option in with_equipment for option in options):
+                problems.append(f'"{name}" não tem nenhuma alternativa sem equipamento.')
+            if not primary[exercise_id]:
+                problems.append(f'"{name}" não tem grupo muscular principal.')
+            for option in options:
+                if not (primary[exercise_id] & primary[option]) and pattern[exercise_id] != pattern[option]:
+                    weak.append(f'{name} → {names[option]}')
 
-            if equipment_free is not None and alternative.is_equipment_free != equipment_free:
-                in_sheet = 'Sim' if equipment_free else 'Não'
-                in_exercise = 'Sim' if alternative.is_equipment_free else 'Não'
-                self.warn(
-                    f'{where}: "{alternative}" está como sem equipamento = {in_sheet} aqui, mas o '
-                    f'exercício está com {in_exercise}. Vale o que está no exercício.'
-                )
-
-            order = parse_int(order_cell)
-            if order is None or order < 1:
-                self.warn(f'{where}: ordem de prioridade vazia ou inválida. Usando 1.')
-                order = 1
-
-            _, created = ExerciseAlternative.objects.update_or_create(
-                exercise=original,
-                alternative=alternative,
-                defaults={'order': order},
-            )
-            self.count('Alternativas', created)
-
-    # ----------------------------------------------------------------- apoio
-
-    def get_or_create_many(self, model, label, names, where):
-        objects = []
-        for name in names:
-            obj, created = model.objects.get_or_create(name=name)
-            if created:
-                self.count(label, True)
-                self.warn(f'{where}: "{name}" não estava na aba {label}. Criado automaticamente.')
-            objects.append(obj)
-        return objects
-
-    def find_or_create_incomplete(self, name, equipment_free, where):
-        exercise = Exercise.objects.filter(name=name).first()
-        if exercise:
-            return exercise
-        exercise = Exercise.objects.create(name=name, is_equipment_free=bool(equipment_free))
-        self.count('Exercícios', True)
-        self.warn(f'{where}: "{name}" não está na aba Exercícios. Criado só com o nome (incompleto).')
-        return exercise
-
-    def check_rules(self, sheet_exercises):
-        for exercise in sheet_exercises:
-            links = list(exercise.alternative_links.select_related('alternative'))
-            if not links:
-                self.rule_problems.append(f'"{exercise}" não tem nenhuma alternativa cadastrada.')
-            elif not any(link.alternative.is_equipment_free for link in links):
-                self.rule_problems.append(f'"{exercise}" não tem nenhuma alternativa sem equipamento.')
-
-    def find_incomplete_exercises(self):
-        incomplete = []
-        for exercise in Exercise.objects.prefetch_related('muscular_groups', 'equipment'):
-            missing = []
-            if not exercise.description:
-                missing.append('descrição')
-            if not exercise.tip:
-                missing.append('dica')
-            if exercise.difficulty_id is None:
-                missing.append('dificuldade')
-            if not exercise.muscular_groups.all():
-                missing.append('grupos musculares')
-            if not exercise.is_equipment_free and not exercise.equipment.all():
-                missing.append('equipamentos')
-            if missing:
-                incomplete.append(f'{exercise}: falta {", ".join(missing)}')
-        return incomplete
-
-    def count(self, label, created):
-        entry = self.stats.setdefault(label, {'criados': 0, 'atualizados': 0})
-        entry['criados' if created else 'atualizados'] += 1
-
-    def warn(self, message):
-        self.warnings.append(message)
+        review = Counter(text(r['status_dados']) for r in tables['exercicio'])
+        flagged_sources = [text(r['titulo']) for r in tables['fonte'] if 'reconferir' in fold(r['tipo'])]
+        return {
+            'problems': problems,
+            'weak': weak,
+            'review': {status: n for status, n in review.items() if fold(status) != 'com fonte'},
+            'flagged_sources': flagged_sources,
+            'free': len(names) - len(with_equipment & set(names)),
+        }
 
     # ---------------------------------------------------------------- relatório
 
-    def print_report(self, dry_run, incomplete, ignored_steps):
+    def print_report(self, options, removed, created, rules):
         out = self.stdout
         out.write('')
         out.write('========== RELATÓRIO DA IMPORTAÇÃO ==========')
-        if dry_run:
+        if options['dry_run']:
             out.write(self.style.WARNING('SIMULAÇÃO (--dry-run): nada foi gravado no banco.'))
         else:
             out.write(self.style.SUCCESS('Importação concluída e gravada no banco.'))
 
-        out.write('\nRegistros:')
-        for label in ['Dificuldades', 'Grupos Musculares', 'Equipamentos', 'Exercícios', 'Alternativas']:
-            entry = self.stats.get(label, {'criados': 0, 'atualizados': 0})
-            out.write(f'  {label}: {entry["criados"]} criados, {entry["atualizados"]} atualizados')
+        out.write(f'\nCatálogo anterior substituído: {removed["Exercícios"]} exercícios removidos.')
+        out.write('\nRegistros no banco após a importação:')
+        for label, count in created.items():
+            out.write(f'  {label}: {count}')
+        out.write(f'  (exercícios sem equipamento: {rules["free"]})')
 
-        self.write_list(f'Avisos da leitura ({len(self.warnings)}):', self.warnings)
-        self.write_list(f'Regras do app não atendidas ({len(self.rule_problems)}):', self.rule_problems)
-        self.write_list(f'Exercícios com dados faltando ({len(incomplete)}):', incomplete)
+        self.write_list(f'Avisos ({len(self.warnings)}):', self.warnings)
+        self.write_list(f'Regras do app não atendidas ({len(rules["problems"])}):', rules['problems'])
 
-        if ignored_steps:
-            out.write('\nA aba "Passos de Execução" foi ignorada: a tabela de passos ainda não existe no banco.')
+        out.write('\nPara o time de Educação Física revisar:')
+        if rules['review']:
+            for status, count in rules['review'].items():
+                out.write(f'  - {count} exercício(s) com status "{status or "vazio"}"')
+        else:
+            out.write('  - todos os exercícios estão com status "Com fonte"')
+        for title in rules['flagged_sources']:
+            out.write(f'  - fonte marcada "a reconferir": {title}')
+        out.write(
+            f'  - {len(rules["weak"])} troca(s) "fraca(s)": a alternativa não tem o mesmo grupo principal '
+            f'nem o mesmo padrão de movimento' + ('' if options['detalhes'] else ' (use --detalhes para listar)')
+        )
+        if options['detalhes']:
+            for item in rules['weak']:
+                out.write(f'      {item}')
 
     def write_list(self, title, items):
         self.stdout.write(f'\n{title}')

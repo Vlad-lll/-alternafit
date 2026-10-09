@@ -45,6 +45,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     # Bibliotecas de terceiros
     'rest_framework',
+    'corsheaders',
     # Apps do projeto
     'users',
     'exercises',
@@ -53,9 +54,17 @@ INSTALLED_APPS = [
 # Diz ao Django para usar o nosso modelo de usuário (users/models.py) no lugar do padrão
 AUTH_USER_MODEL = 'users.User'
 
+# Endereços do frontend que podem consultar a API pelo navegador (servidor do Vite)
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+]
+
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
+    # O CORS precisa vir antes do CommonMiddleware para funcionar
+    'corsheaders.middleware.CorsMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
