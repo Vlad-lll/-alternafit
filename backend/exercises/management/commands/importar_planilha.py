@@ -21,12 +21,14 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
+from zipfile import BadZipFile
 
 from django.core.exceptions import ValidationError
 from django.core.management.base import BaseCommand, CommandError
 from django.core.validators import URLValidator
 from django.db import transaction
 from openpyxl import load_workbook
+from openpyxl.utils.exceptions import InvalidFileException
 
 from exercises.models import (
     Difficulty,
@@ -59,6 +61,24 @@ SHEETS = {
     'exercicio_apelido': ['exercicio_id', 'apelido'],
     'exercicio_fonte': ['exercicio_id', 'fonte_id'],
 }
+
+# Colunas de texto e o campo do banco onde elas são gravadas (para conferir o tamanho máximo).
+TEXT_LIMITS = [
+    ('nivel_dificuldade', 'nome', Difficulty, 'name'),
+    ('grupo_muscular', 'nome', MuscularGroup, 'name'),
+    ('grupo_muscular', 'codigo', MuscularGroup, 'code'),
+    ('equipamento', 'nome', Equipment, 'name'),
+    ('padrao_movimento', 'codigo', MovementPattern, 'code'),
+    ('padrao_movimento', 'nome', MovementPattern, 'name'),
+    ('fonte', 'autor_organizacao', Source, 'author'),
+    ('fonte', 'titulo', Source, 'title'),
+    ('fonte', 'url', Source, 'url'),
+    ('fonte', 'tipo', Source, 'source_type'),
+    ('exercicio', 'nome', Exercise, 'name'),
+    ('exercicio', 'nome_en', Exercise, 'name_en'),
+    ('exercicio', 'video_url', Exercise, 'video_url'),
+    ('exercicio_apelido', 'apelido', ExerciseAlias, 'alias'),
+]
 
 ROLE_VALUES = {
     'primario': ExerciseMuscularGroup.Role.PRIMARY,
@@ -144,7 +164,13 @@ class Command(BaseCommand):
     # ------------------------------------------------------------------ leitura
 
     def read_workbook(self, path):
-        workbook = load_workbook(path, data_only=True, read_only=True)
+        try:
+            workbook = load_workbook(path, data_only=True, read_only=True)
+        except (InvalidFileException, BadZipFile, KeyError, OSError):
+            raise CommandError(
+                f'"{path.name}" não é uma planilha do Excel (.xlsx) válida ou não pôde ser aberta. '
+                'Se o arquivo estiver aberto no Excel, feche e tente de novo.'
+            )
         try:
             tables = {}
             for sheet_name, required in SHEETS.items():
@@ -174,6 +200,18 @@ class Command(BaseCommand):
         self.errors.append(f'{sheet}, linha {record["_linha"]}: {message}')
 
     def validate(self, tables):
+        # Proteção: uma planilha vazia apagaria o catálogo inteiro sem colocar nada no lugar.
+        if not tables['exercicio']:
+            self.errors.append('A planilha não tem nenhum exercício na aba "exercicio". Nada foi importado.')
+            return
+
+        for sheet, column, model, field in TEXT_LIMITS:
+            limit = model._meta.get_field(field).max_length
+            for record in tables[sheet]:
+                size = len(text(record[column]))
+                if size > limit:
+                    self.error(sheet, record, f'{column} tem {size} caracteres; o máximo é {limit}.')
+
         ids = {}
         for sheet in ['nivel_dificuldade', 'grupo_muscular', 'equipamento', 'padrao_movimento', 'fonte', 'exercicio']:
             seen = set()

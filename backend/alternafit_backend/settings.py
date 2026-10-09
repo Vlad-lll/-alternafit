@@ -106,6 +106,12 @@ DATABASES = {
         'OPTIONS': {
             'charset': 'utf8mb4',
         },
+        # O banco temporário dos testes usa a mesma regra de comparação de textos
+        # do banco real (ignora maiúsculas e acentos), para os testes valerem de verdade.
+        'TEST': {
+            'CHARSET': 'utf8mb4',
+            'COLLATION': 'utf8mb4_unicode_ci',
+        },
     }
 }
 
